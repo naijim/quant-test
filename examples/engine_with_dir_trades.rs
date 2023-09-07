@@ -18,7 +18,7 @@ use barter::{
 };
 use barter_data::{
     event::{DataKind, MarketEvent},
-    subscription::{candle::Candle, trade::PublicTrade},
+    subscription::trade::PublicTrade,
 };
 use barter_integration::model::{
     instrument::{kind::InstrumentKind, Instrument},
@@ -35,8 +35,6 @@ use std::{fs::File, path::PathBuf};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use uuid::Uuid;
-
-const DATA_HISTORIC_CANDLES_1H: &str = "examples/data/candles_1h.json";
 
 #[tokio::main]
 async fn main() {
@@ -127,24 +125,6 @@ async fn main() {
 
     let duration = start.elapsed();
     println!("Time elapsed is: {:?}", duration);
-}
-
-fn load_json_market_event_candles() -> Vec<MarketEvent<DataKind>> {
-    let candles = fs::read_to_string(DATA_HISTORIC_CANDLES_1H).expect("failed to read file");
-
-    let candles =
-        serde_json::from_str::<Vec<Candle>>(&candles).expect("failed to parse candles String");
-
-    candles
-        .into_iter()
-        .map(|candle| MarketEvent {
-            exchange_time: candle.close_time,
-            received_time: Utc::now(),
-            exchange: Exchange::from("binance"),
-            instrument: Instrument::from(("btc", "usdt", InstrumentKind::Spot)),
-            kind: DataKind::Candle(candle),
-        })
-        .collect()
 }
 
 // Listen to Events that occur in the Engine. These can be used for updating event-sourcing,
