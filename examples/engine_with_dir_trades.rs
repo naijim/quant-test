@@ -1,5 +1,6 @@
+use async_stream::stream;
 use barter::{
-    data::historical,
+    data::live,
     engine::{trader::Trader, Engine},
     event::{Event, EventTx},
     execution::{
@@ -25,15 +26,22 @@ use barter_integration::model::{
     Exchange, Market, Side,
 };
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use futures::stream::{self, StreamExt};
+use futures_core::stream::Stream;
+use futures_util::pin_mut;
 use parking_lot::Mutex;
 use regex::Regex;
 use serde::Deserialize;
-use std::io::{prelude::*, BufReader};
+use std::marker::PhantomPinned;
+use std::path::PathBuf;
+use std::pin::Pin;
 use std::time::Instant;
 use std::{collections::HashMap, fs, io, sync::Arc};
-use std::{fs::File, path::PathBuf};
 use thiserror::Error;
+use tokio::fs::File;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
+use tokio_stream::wrappers::LinesStream;
 use uuid::Uuid;
 
 #[tokio::main]
@@ -79,7 +87,7 @@ async fn main() {
     // Create channel for each Trader so the Engine can distribute Commands to it
     let (trader_command_tx, trader_command_rx) = mpsc::channel(10);
 
-    let data = load_binance_trade_init().unwrap();
+    let datac = load_binance_trade_init().await.unwrap();
 
     traders.push(
         Trader::builder()
@@ -88,7 +96,7 @@ async fn main() {
             .command_rx(trader_command_rx)
             .event_tx(event_tx.clone())
             .portfolio(Arc::clone(&portfolio))
-            .data(historical::MarketFeed::new(data.into_iter()))
+            .data(live::MarketFeed::new(datac))
             .strategy(RSIStrategy::new(StrategyConfig { rsi_period: 14 }))
             .execution(SimulatedExecution::new(ExecutionConfig {
                 simulated_fees_pct: Fees {
@@ -173,8 +181,8 @@ async fn listen_to_engine_events(mut event_rx: mpsc::UnboundedReceiver<Event>) {
     }
 }
 
-fn load_binance_trade_init(
-) -> std::result::Result<Vec<MarketEvent<DataKind>>, MultipleFilesReaderError> {
+async fn load_binance_trade_init(
+) -> std::result::Result<mpsc::UnboundedReceiver<MarketEvent<DataKind>>, MultipleFilesReaderError> {
     let mut reader = BinanceTradeReader::new(
         "/Users/jack/Workspace/crypto/data/binance/trade_tick",
         DateTime::<Utc>::from_naive_utc_and_offset(
@@ -191,12 +199,7 @@ fn load_binance_trade_init(
                 .unwrap(),
             Utc,
         ),
-    );
-    reader.build_and_init()?;
-
-    let res = reader
-        .into_iter()
-        .map(|trade| MarketEvent {
+        |trade: &BinanceTradeRecord| MarketEvent {
             exchange_time: DateTime::<Utc>::from_naive_utc_and_offset(
                 NaiveDateTime::from_timestamp_millis(trade.4).unwrap(),
                 Utc,
@@ -205,10 +208,22 @@ fn load_binance_trade_init(
             exchange: Exchange::from("binance"),
             instrument: Instrument::from(("btc", "usdt", InstrumentKind::Spot)),
             kind: DataKind::Trade(PublicTrade::from(trade)),
-        })
-        .collect();
+        },
+    );
+    reader.build_and_init().await;
 
-    Ok(res)
+    let (tx, rx) = mpsc::unbounded_channel();
+    let s = reader_into_stream(reader);
+
+    tokio::spawn(async move {
+        pin_mut!(s);
+
+        while let Some(trade) = s.next().await {
+            let _ = tx.send(MarketEvent::from(trade));
+        }
+    });
+
+    Ok(rx)
 }
 
 #[derive(Error, Debug)]
@@ -229,10 +244,10 @@ enum MultipleFilesReaderError {
 struct MultipleFilesReader {
     data_path: String,
     data_files: Option<Box<dyn Iterator<Item = String>>>,
-    reader: Option<std::io::Lines<std::io::BufReader<File>>>,
+    reader: Option<LinesStream<tokio::io::BufReader<tokio::fs::File>>>,
 
     // for filtering filename with time range
-    filter_func: Box<dyn Fn(&DateTime<Utc>, &DateTime<Utc>, &str) -> bool>,
+    filter_func: Box<dyn Fn(&DateTime<Utc>, &DateTime<Utc>, &str) -> bool + Send + Sync>,
     from_datetime: DateTime<Utc>,
     to_datetime: DateTime<Utc>,
 }
@@ -240,7 +255,7 @@ struct MultipleFilesReader {
 impl MultipleFilesReader {
     pub fn new(
         value: &str,
-        f: impl Fn(&DateTime<Utc>, &DateTime<Utc>, &str) -> bool + 'static,
+        f: impl Fn(&DateTime<Utc>, &DateTime<Utc>, &str) -> bool + Send + Sync,
         from_datetime: DateTime<Utc>,
         to_datetime: DateTime<Utc>,
     ) -> Self {
@@ -255,7 +270,7 @@ impl MultipleFilesReader {
         }
     }
 
-    pub fn build_and_init(&mut self) -> std::result::Result<(), MultipleFilesReaderError> {
+    pub async fn build_and_init(&mut self) -> std::result::Result<(), MultipleFilesReaderError> {
         // get a list of all entries in the folder
         let entries = fs::read_dir(self.data_path.as_str())?;
 
@@ -276,7 +291,7 @@ impl MultipleFilesReader {
         self.data_files = Some(Box::new(file_names.into_iter()));
 
         // open first file if any
-        self.load_next_file()?;
+        self.load_next_file().await?;
 
         return Ok(());
     }
@@ -301,24 +316,26 @@ impl MultipleFilesReader {
     }
 
     // if no error, readline returns next line or eof
-    fn load_next_file(&mut self) -> std::result::Result<(), MultipleFilesReaderError> {
+    async fn load_next_file(&mut self) -> std::result::Result<(), MultipleFilesReaderError> {
         match self.find_next_file() {
             Ok(filename) => {
-                self.reader = Some(BufReader::new(File::open(filename)?).lines());
+                let file = File::open(filename).await?;
+                self.reader = Some(LinesStream::new(BufReader::new(file).lines()));
+
                 return Ok(());
             }
             Err(e) => return Err(e),
         }
     }
 
-    fn readline(&mut self) -> std::result::Result<String, MultipleFilesReaderError> {
+    async fn readline(&mut self) -> std::result::Result<String, MultipleFilesReaderError> {
         match &mut self.reader {
-            Some(reader) => match reader.next() {
+            Some(reader) => match reader.next().await {
                 Some(line) => match line {
                     Ok(line) => return Ok(line),
                     Err(e) => return Err(MultipleFilesReaderError::IOError(e)),
                 },
-                None => match self.load_next_file() {
+                None => match self.load_next_file().await {
                     Ok(()) => return Err(MultipleFilesReaderError::TryAgain),
                     Err(e) => return Err(e),
                 },
@@ -326,22 +343,20 @@ impl MultipleFilesReader {
             None => return Err(MultipleFilesReaderError::NoFile),
         }
     }
-}
 
-impl Iterator for MultipleFilesReader {
-    type Item = String;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            match self.readline() {
-                Ok(line) => return Some(line),
-                Err(e) => match e {
-                    MultipleFilesReaderError::TryAgain => continue,
-                    MultipleFilesReaderError::NoFile
-                    | MultipleFilesReaderError::NoMoreFiles
-                    | MultipleFilesReaderError::IOError(_) => return None,
-                },
-            };
+    pub fn into_stream(mut self) -> impl Stream<Item = String> {
+        stream! {
+            loop {
+                match self.readline().await {
+                    Ok(line) => yield line,
+                    Err(e) => match e {
+                        MultipleFilesReaderError::TryAgain => continue,
+                        MultipleFilesReaderError::NoFile
+                        | MultipleFilesReaderError::NoMoreFiles
+                        | MultipleFilesReaderError::IOError(_) => break,
+                    },
+                };
+            }
         }
     }
 }
@@ -349,8 +364,8 @@ impl Iterator for MultipleFilesReader {
 #[derive(Debug, PartialEq, Deserialize)]
 struct BinanceTradeRecord(u64, f64, f64, f64, i64, String, String);
 
-impl From<BinanceTradeRecord> for PublicTrade {
-    fn from(item: BinanceTradeRecord) -> Self {
+impl From<&BinanceTradeRecord> for PublicTrade {
+    fn from(item: &BinanceTradeRecord) -> Self {
         PublicTrade {
             id: item.0.to_string(),
             price: item.1,
@@ -370,20 +385,32 @@ struct BinanceTradeReader {
     from_date: DateTime<Utc>,
     to_date: DateTime<Utc>,
 
-    files_reader_iter: Option<Box<dyn Iterator<Item = String>>>,
+    files_reader_iter: Option<Pin<Box<dyn Stream<Item = String>>>>,
+
+    convert_func: Box<dyn Fn(&BinanceTradeRecord) -> MarketEvent<DataKind> + Send + Sync>,
+
+    _marker: PhantomPinned,
 }
 
 impl BinanceTradeReader {
-    pub fn new(data_path: &str, from_date: DateTime<Utc>, to_date: DateTime<Utc>) -> Self {
+    pub fn new(
+        data_path: &str,
+        from_date: DateTime<Utc>,
+        to_date: DateTime<Utc>,
+        c: impl Fn(&BinanceTradeRecord) -> MarketEvent<DataKind> + Send + Sync,
+    ) -> Self {
         Self {
             data_path: data_path.to_owned(),
             from_date: from_date,
             to_date: to_date,
             files_reader_iter: None,
+            convert_func: Box::new(c),
+
+            _marker: PhantomPinned,
         }
     }
 
-    pub fn build_and_init(&mut self) -> std::result::Result<(), MultipleFilesReaderError> {
+    pub async fn build_and_init(&mut self) -> std::result::Result<(), MultipleFilesReaderError> {
         let mut reader = MultipleFilesReader::new(
             &self.data_path,
             BinanceTradeReader::filter_data_file,
@@ -391,8 +418,11 @@ impl BinanceTradeReader {
             self.to_date.clone(),
         );
 
-        match reader.build_and_init() {
-            Ok(_) => self.files_reader_iter = Some(Box::new(reader.into_iter())),
+        match reader.build_and_init().await {
+            Ok(_) => {
+                self.files_reader_iter = Some(reader.into_stream())
+                    .map(|i| -> Pin<Box<dyn Stream<Item = String>>> { Box::pin(i) })
+            }
             Err(e) => return Err(e),
         };
 
@@ -465,17 +495,17 @@ impl BinanceTradeReader {
     }
 }
 
-impl Iterator for BinanceTradeReader {
-    type Item = BinanceTradeRecord;
-
-    fn next(&mut self) -> Option<Self::Item> {
+pub fn reader_into_stream(reader: BinanceTradeReader) -> impl Stream<Item = MarketEvent<DataKind>> {
+    stream::unfold(reader, |mut reader| async move {
         loop {
-            if let Some(ref mut iter) = self.files_reader_iter {
-                match iter.next() {
+            if let Some(ref mut iter) = reader.files_reader_iter {
+                match iter.next().await {
                     Some(x) => match csv_line::from_str::<BinanceTradeRecord>(&x) {
                         Ok(e) => {
-                            if self.filter_data(&e) {
-                                return Some(e);
+                            if reader.filter_data(&e) {
+                                let res = (*reader.convert_func)(&e);
+
+                                break Some((res, reader));
                             } else {
                                 continue;
                             }
@@ -484,9 +514,9 @@ impl Iterator for BinanceTradeReader {
                         // TODO: parse failure, log error
                         Err(_) => continue,
                     },
-                    None => return None,
+                    None => break None,
                 }
             }
         }
-    }
+    })
 }

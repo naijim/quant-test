@@ -22,9 +22,12 @@ barter-integration = "0.5.3"
 tracing = "0.1.36"
 
 # Async
-tokio = { version = "1.32.0", features = ["sync"] }
-tokio-stream = { version = "0.1.14", features = ["sync"] }
+tokio = { version = "1.32.0", features = ["sync", "fs", "io-util"] }
+tokio-stream = { version = "0.1.14", features = ["sync", "io-util"] }
 futures = "0.3.28"
+async-stream = "0.3.5"
+futures-core = "0.3.28"
+futures-util = "0.3.28"
 
 # Error
 thiserror = "1.0.32"
